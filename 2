@@ -1,0 +1,274 @@
+// ==UserScript==
+// @name         Automatización Facturación - Booking Gross
+// @namespace    http://tampermonkey.net/
+// @version      1.1
+// @description  Automatización de ingreso de datos desde Excel
+// @author       Tu Nombre
+// @match        *://*.miweb.com/SWAppWeb/pages/ifds/gross/manualgross/bom_bo_act_search.xhtml*
+// @match        *://*.miweb.com/SWAppWeb/pages/ifds/gross/manualgross/bom_bo_gross_details.xhtml*
+// @match        *://*.miweb.com/SWAppWeb/pages/ifds/gross/bodeduction/bom_bo_deduction_detail.xhtml*
+// @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ==========================================
+    // UTILIDADES: Espera dinámica de elementos
+    // ==========================================
+    function waitForElement(selector, timeout = 15000) {
+        return new Promise((resolve, reject) => {
+            if (document.querySelector(selector)) {
+                return resolve(document.querySelector(selector));
+            }
+            const observer = new MutationObserver((mutations) => {
+                if (document.querySelector(selector)) {
+                    observer.disconnect();
+                    resolve(document.querySelector(selector));
+                }
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+            setTimeout(() => {
+                observer.disconnect();
+                reject(new Error("Timeout esperando el elemento: " + selector));
+            }, timeout);
+        });
+    }
+
+    // ==========================================
+    // INTERFAZ DE USUARIO (Selector de Archivo)
+    // ==========================================
+    function createUI() {
+        if(document.getElementById('tm-automation-panel')) return;
+        
+        GM_addStyle(`
+            #tm-automation-panel { position: fixed; top: 10px; right: 10px; z-index: 999999; background: #2c3e50; color: white; padding: 15px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); font-family: sans-serif; font-size: 14px; width: 300px; }
+            #tm-automation-panel h3 { margin: 0 0 10px 0; font-size: 16px; border-bottom: 1px solid #4ca1af; padding-bottom: 5px; }
+            #tm-automation-panel input[type="file"] { margin-bottom: 10px; width: 100%; }
+            #tm-automation-panel button { background: #27ae60; color: white; border: none; padding: 8px 12px; cursor: pointer; border-radius: 4px; width: 100%; margin-bottom: 5px;}
+            #tm-automation-panel button:hover { background: #2ecc71; }
+            #tm-automation-panel button.stop-btn { background: #c0392b; }
+            #tm-automation-panel button.stop-btn:hover { background: #e74c3c; }
+            #tm-status { margin-top: 10px; font-size: 12px; color: #f1c40f; }
+        `);
+
+        let panel = document.createElement('div');
+        panel.id = 'tm-automation-panel';
+        panel.innerHTML = `
+            <h3>Bot de Facturación</h3>
+            <input type="file" id="tm-excel-upload" accept=".xlsx, .xls">
+            <button id="tm-start-btn">Iniciar Proceso</button>
+            <button id="tm-stop-btn" class="stop-btn">Detener y Descargar</button>
+            <div id="tm-status">Esperando archivo...</div>
+        `;
+        document.body.appendChild(panel);
+
+        document.getElementById('tm-start-btn').addEventListener('click', handleFileUpload);
+        document.getElementById('tm-stop-btn').addEventListener('click', stopAndDownload);
+    }
+
+    // ==========================================
+    // MANEJO DE EXCEL
+    // ==========================================
+    function handleFileUpload() {
+        let fileInput = document.getElementById('tm-excel-upload');
+        if (!fileInput.files.length) {
+            alert("Por favor selecciona un archivo Excel primero.");
+            return;
+        }
+
+        let file = fileInput.files[0];
+        let reader = new FileReader();
+        reader.onload = function(e) {
+            let data = new Uint8Array(e.target.result);
+            let workbook = XLSX.read(data, {type: 'array'});
+            let firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+            // Convertir a array de arrays (header:1) para mantener los índices de las columnas fijos
+            let excelData = XLSX.utils.sheet_to_json(firstSheet, {header: 1, raw: false});
+            
+            // Iniciar proceso
+            GM_setValue('excelData', excelData);
+            GM_setValue('currentRow', 1); // Fila 1 (omitiendo encabezados en fila 0)
+            GM_setValue('isRunning', true);
+            GM_setValue('step', 1);
+            
+            runProcess();
+        };
+        reader.readAsArrayBuffer(file);
+    }
+
+    function logResult(status, adm = "", gross = "") {
+        let data = GM_getValue('excelData');
+        let rowIdx = GM_getValue('currentRow');
+        
+        // M = índice 12, N = 13, O = 14
+        data[rowIdx][12] = status; // M: Log
+        if(adm !== "") data[rowIdx][13] = adm; // N: Adm
+        if(gross !== "") data[rowIdx][14] = gross; // O: Gross
+
+        GM_setValue('excelData', data);
+    }
+
+    function stopAndDownload() {
+        GM_setValue('isRunning', false);
+        let data = GM_getValue('excelData');
+        if(!data) {
+            alert("No hay datos en memoria para descargar.");
+            return;
+        }
+        
+        let ws = XLSX.utils.aoa_to_sheet(data);
+        let wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Resultados");
+        XLSX.writeFile(wb, "Facturacion_Completada.xlsx");
+        document.getElementById('tm-status').innerText = "Proceso detenido. Archivo descargado.";
+    }
+
+    // ==========================================
+    // LÓGICA PRINCIPAL DEL BOT (MÁQUINA DE ESTADOS)
+    // ==========================================
+    async function runProcess() {
+        if (!GM_getValue('isRunning', false)) {
+            createUI();
+            return;
+        }
+
+        createUI();
+        let data = GM_getValue('excelData');
+        let rowIdx = GM_getValue('currentRow');
+        let step = GM_getValue('step');
+
+        // Condición de finalización
+        if (rowIdx >= data.length) {
+            stopAndDownload();
+            return;
+        }
+
+        let currentRowData = data[rowIdx];
+        // Si la fila está vacía, saltar a la siguiente
+        if (!currentRowData || currentRowData.length < 5) {
+            GM_setValue('currentRow', rowIdx + 1);
+            location.reload();
+            return;
+        }
+
+        let bkgNo = currentRowData[3];      // Columna D
+        let playDate = currentRowData[4];   // Columna E
+        let adm = currentRowData[5];        // Columna F
+        let gross = currentRowData[6];      // Columna G
+
+        document.getElementById('tm-status').innerText = `Procesando fila ${rowIdx + 1}: BKG ${bkgNo} | Paso ${step}`;
+
+        try {
+            if (step === 1) {
+                // #Paso 1#: Buscar el Booking
+                let searchInput = await waitForElement('#grossSearchForm\\:bookingTagId');
+                searchInput.value = bkgNo;
+                
+                let searchBtn = await waitForElement('#grossSearchForm\\:search');
+                GM_setValue('step', 2);
+                searchBtn.click();
+                // Al hacer click es probable que haya una recarga AJAX, manejamos la espera en el Paso 2
+                setTimeout(runProcess, 2000); 
+
+            } else if (step === 2) {
+                // #Paso 2#: Validar tabla y checkear
+                await waitForElement('#grossSearchForm\\:dtTable');
+                let tbody = document.querySelector("#grossSearchForm\\:dtTable_data") || document.querySelector("#grossSearchForm\\:dtTable tbody");
+                let rows = tbody.querySelectorAll("tr");
+                let actionResult = "no hay fecha";
+                
+                // Formatear la fecha del Excel (M/D/YYYY) a formato Web (MM/DD/YYYY)
+                let dateParts = String(playDate).split('/');
+                let formattedPlayDate = dateParts.length === 3 
+                    ? `${dateParts[0].padStart(2, '0')}/${dateParts[1].padStart(2, '0')}/${dateParts[2]}` 
+                    : playDate;
+                
+                for(let i = 0; i < rows.length; i++) {
+                    let cols = rows[i].querySelectorAll("td");
+                    if(cols.length >= 19) {
+                        // Col 14 es índice 13 (Playdate Start Date)
+                        let dateText = cols[13].innerText.trim();
+                        
+                        if(dateText === formattedPlayDate) {
+                            // Col 16 = índice 15 (Adm), Col 19 = índice 18 (Gross BO)
+                            let admVal = cols[15].innerText.trim();
+                            let grossVal = cols[18].innerText.trim();
+                            
+                            if (admVal !== "0" || (grossVal !== "0.00" && grossVal !== "0")) {
+                                actionResult = "ya estaba digitado";
+                            } else {
+                                // Seleccionar Checkbox
+                                let checkbox = rows[i].querySelector("input[type='checkbox']") || rows[i].querySelector(".ui-chkbox-box");
+                                if(checkbox) checkbox.click();
+                                actionResult = "ok";
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                if (actionResult === "ok") {
+                    let continueBtn = await waitForElement('#grossSearchForm\\:continueBOMDetailAction');
+                    GM_setValue('step', 3);
+                    continueBtn.click(); // Esto recargará la página hacia details
+                } else {
+                    logResult(actionResult); // Registra "no hay fecha" o "ya estaba digitado"
+                    GM_setValue('step', 5); // Saltamos al clear
+                    runProcess(); // Continuar el flujo
+                }
+
+            } else if (step === 3) {
+                // #Paso 3#: Llenar detalle y guardar
+                let admInput = await waitForElement('#showBOMDetailAction\\:tab1Id\\:dtTable\\:0\\:boweeklyReturnId\\:5\\:weeklyTotal5');
+                let grossInput = await waitForElement('#showBOMDetailAction\\:tab1Id\\:dtTable\\:0\\:boweeklyReturnId\\:6\\:weeklyTotal6');
+                
+                admInput.value = adm;
+                grossInput.value = gross;
+                
+                let saveBtn = await waitForElement('#showBOMDetailAction\\:tab1Id\\:saveManualGross');
+                GM_setValue('step', 4);
+                saveBtn.click(); // Recarga la página hacia deduction
+
+            } else if (step === 4) {
+                // #Paso 4#: Retornar a la búsqueda principal
+                let returnBtn = await waitForElement('#saveBODeduction\\:fromGrosses');
+                
+                // Registramos el éxito en el log
+                logResult("Digitado", adm, gross);
+                
+                GM_setValue('step', 5);
+                returnBtn.click(); // Recarga la página de vuelta a act_search
+
+            } else if (step === 5) {
+                // #Paso 5#: Limpiar e iterar
+                let clearBtn = await waitForElement('#grossSearchForm\\:clear');
+                
+                // Avanzamos fila y reseteamos paso
+                GM_setValue('currentRow', rowIdx + 1);
+                GM_setValue('step', 1);
+                
+                clearBtn.click();
+                
+                // Damos tiempo de recarga antes de la siguiente iteración
+                setTimeout(() => {
+                    location.reload(); 
+                }, 1500);
+            }
+
+        } catch (error) {
+            console.error("Error en la automatización:", error);
+            logResult("Error en página: " + error.message);
+            // Ante un error imprevisto, se intenta limpiar e ir a la siguiente fila
+            GM_setValue('step', 5);
+            runProcess();
+        }
+    }
+
+    // Iniciar ejecución si la página cargó y está activado
+    window.addEventListener('load', runProcess);
+
+})();
